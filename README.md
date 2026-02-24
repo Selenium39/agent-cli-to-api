@@ -13,8 +13,22 @@ Supported backends:
 - **Gemini** - via CLI or CloudCode direct (set `GEMINI_USE_CLOUDCODE_API=1`)
 
 Why this exists:
-- Many tools/SDKs only speak the OpenAI API (`/v1/chat/completions`) — this lets you plug agent CLIs into that ecosystem.
+- Many tools/SDKs only speak the OpenAI API (`/v1/chat/completions`) - this lets you plug agent CLIs into that ecosystem.
 - One gateway, multiple CLIs: pick a backend by `model` (with optional prefixes like `cursor:` / `claude:` / `gemini:`).
+
+## Table of Contents
+
+- [Requirements](#requirements)
+- [Install](#install)
+- [Run (No `.env` Needed)](#run-no-env-needed)
+- [Core Configuration](#core-configuration)
+- [API](#api)
+- [OpenAI SDK examples](#openai-sdk-examples)
+- [Security notes](#security-notes)
+- [Logging & Performance Diagnosis](#logging--performance-diagnosis)
+- [Performance notes (important)](#performance-notes-important)
+- [Advanced setup (optional)](#advanced-setup-optional)
+- [Keywords (SEO)](#keywords-seo)
 
 ## Requirements
 
@@ -90,6 +104,73 @@ BASE_URL=http://127.0.0.1:8000/v1 ./scripts/smoke.sh
 TOKEN=devtoken BASE_URL=http://127.0.0.1:8000/v1 ./scripts/smoke.sh
 ```
 
+## Core Configuration
+
+### Presets
+
+```bash
+export CODEX_PRESET=codex-fast
+uv run agent-cli-to-api codex
+```
+
+Supported presets:
+- `codex-fast`
+- `autoglm-phone`
+- `cursor-auto`
+- `cursor-fast` (Cursor model pinned for speed)
+- `gemini-cloudcode` (defaults to `gemini-3-flash-preview`)
+- `claude-oauth`
+
+### Multi-provider routing
+
+Use `CODEX_PROVIDER=auto` and select providers per-request by prefixing `model`:
+- Codex: `"gpt-5.2"`
+- Cursor: `"cursor:<model>"`
+- Claude: `"claude:<model>"`
+- Gemini: `"gemini:<model>"`
+
+### Codex backend options
+
+- `CODEX_CODEX_ALLOW_TOOLS=0` to disable Codex backend tool calls (default: enabled).
+- OpenAI `tools`/`tool_choice` are mapped for Codex backend, Claude OAuth, and Gemini CloudCode (best-effort).
+
+### Claude direct API (recommended)
+
+The gateway **auto-detects** your Claude CLI configuration from `~/.claude/settings.json`:
+
+```bash
+# If you have Claude CLI configured with a custom API endpoint (e.g. 小米 MiMo, 腾讯混元, etc.)
+# Just run - no extra config needed:
+uv run agent-cli-to-api claude
+```
+
+The gateway will automatically:
+1. Read `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` from `~/.claude/settings.json`
+2. Use direct HTTP API calls (fast, ~0ms gateway overhead)
+3. Log timing breakdown: `auth_ms`, `prepare_ms`, `api_latency_ms`
+
+Alternative: Claude OAuth (Anthropic official):
+
+```bash
+uv run python -m codex_gateway.claude_oauth_login
+CLAUDE_USE_OAUTH_API=1 uv run agent-cli-to-api claude
+```
+
+### `uvx` (no venv)
+
+```bash
+uvx --from git+https://github.com/leeguooooo/agent-cli-to-api agent-cli-to-api codex
+```
+
+### Cloudflare Tunnel
+
+```bash
+CODEX_GATEWAY_TOKEN=devtoken uv run agent-cli-to-api codex
+cloudflared tunnel --url http://127.0.0.1:8000
+```
+
+For advanced env vars, see `.env.example` and `codex_gateway/config.py`.
+
 ## API
 
 - `GET /healthz`
@@ -98,6 +179,8 @@ TOKEN=devtoken BASE_URL=http://127.0.0.1:8000/v1 ./scripts/smoke.sh
 - `POST /v1/chat/completions` (supports `stream`)
 
 Tip: any OpenAI SDK that supports `base_url` should work by pointing it at this server.
+
+Auth note: include `Authorization: Bearer <token>` only when you set `CODEX_GATEWAY_TOKEN` on the gateway.
 
 ### Example (non-stream)
 
@@ -154,7 +237,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   -d @/tmp/payload.json
 ```
 
-### OpenAI SDK examples
+## OpenAI SDK examples
 
 Python:
 
@@ -187,8 +270,65 @@ const resp = await client.chat.completions.create({
 console.log(resp.choices[0].message.content);
 ```
 
-<details>
-<summary><strong>Advanced (Optional): .env / env vars / multi-provider / tunnels</strong></summary>
+## Security notes
+
+You are exposing an agent that can read files and run commands depending on `CODEX_SANDBOX`.
+Keep it private by default, use a token, and run in an isolated environment when deploying.
+
+## Logging & Performance Diagnosis
+
+The gateway provides detailed timing logs to help diagnose latency:
+
+```
+INFO  claude-oauth request: url=https://api.example.com/v1/messages model=xxx auth_ms=0 prepare_ms=0
+INFO  claude-oauth response: status=200 api_latency_ms=2886 parse_ms=0 total_ms=2887
+```
+
+| Metric | Description |
+|--------|-------------|
+| `auth_ms` | Time to load/refresh credentials |
+| `prepare_ms` | Time to build request payload |
+| `api_latency_ms` | **Upstream API response time** (main bottleneck) |
+| `parse_ms` | Time to parse response |
+| `total_ms` | Total gateway processing time |
+
+If `api_latency_ms` ≈ `total_ms`, the latency is entirely from the upstream API (not the gateway).
+
+### Log modes
+
+```bash
+CODEX_LOG_MODE=summary  # one line per request (default)
+CODEX_LOG_MODE=qa       # show Q (question) and A (answer)
+CODEX_LOG_MODE=full     # full prompt + response
+```
+
+## Performance notes (important)
+
+If your normal `~/.codex/config.toml` has many `mcp_servers.*` entries, **Codex will start them for every `codex exec` call**
+and include their tool schemas in the prompt. This can add **seconds of startup time** and **10k+ prompt tokens** per request.
+
+For an HTTP gateway, it's usually best to run Codex with a minimal config (no MCP servers).
+
+By default the gateway uses your system `~/.codex` (so auth stays in sync).
+If you want a minimal, isolated config (no MCP servers), set `CODEX_CLI_HOME` to a gateway-local directory.
+On first run it will try to copy `~/.codex/auth.json` into that directory (so you don't have to).
+
+If you want to set it up manually or customize it:
+
+```bash
+export CODEX_CLI_HOME=$PWD/.codex-gateway-home
+mkdir -p "$CODEX_CLI_HOME/.codex"
+cp ~/.codex/auth.json "$CODEX_CLI_HOME/.codex/auth.json"   # or set CODEX_API_KEY instead
+cat > "$CODEX_CLI_HOME/.codex/config.toml" <<'EOF'
+model = "gpt-5.2"
+model_reasoning_effort = "low"
+
+[projects."/path/to/your/workspace"]
+trust_level = "trusted"
+EOF
+```
+
+## Advanced setup (optional)
 
 ### Use `.env`
 
@@ -249,132 +389,6 @@ export CODEX_LOG_REQUEST_CURL=1
 uv run agent-cli-to-api codex
 ```
 
-### Presets
-
-```bash
-export CODEX_PRESET=codex-fast
-uv run agent-cli-to-api codex
-```
-
-Supported presets:
-- `codex-fast`
-- `autoglm-phone`
-- `cursor-auto`
-- `cursor-fast` (Cursor model pinned for speed)
-- `gemini-cloudcode` (defaults to `gemini-3-flash-preview`)
-- `claude-oauth`
-- `gemini-cloudcode`
-
-### Codex backend options
-
-- `CODEX_CODEX_ALLOW_TOOLS=0` to disable Codex backend tool calls (default: enabled).
-- OpenAI `tools`/`tool_choice` are mapped for Codex backend, Claude OAuth, and Gemini CloudCode (best-effort).
-
-### Claude direct API (recommended)
-
-The gateway **auto-detects** your Claude CLI configuration from `~/.claude/settings.json`:
-
-```bash
-# If you have Claude CLI configured with a custom API endpoint (e.g. 小米 MiMo, 腾讯混元, etc.)
-# Just run - no extra config needed:
-uv run agent-cli-to-api claude
-```
-
-The gateway will automatically:
-1. Read `ANTHROPIC_AUTH_TOKEN` and `ANTHROPIC_BASE_URL` from `~/.claude/settings.json`
-2. Use direct HTTP API calls (fast, ~0ms gateway overhead)
-3. Log timing breakdown: `auth_ms`, `prepare_ms`, `api_latency_ms`
-
-**Alternative: Claude OAuth (Anthropic official)**
-
-```bash
-uv run python -m codex_gateway.claude_oauth_login
-CLAUDE_USE_OAUTH_API=1 uv run agent-cli-to-api claude
-```
-
-### Multi-provider routing
-
-Use `CODEX_PROVIDER=auto` and select providers per-request by prefixing `model`:
-- Codex: `"gpt-5.2"`
-- Cursor: `"cursor:<model>"`
-- Claude: `"claude:<model>"`
-- Gemini: `"gemini:<model>"`
-
-### `uvx` (no venv)
-
-```bash
-uvx --from git+https://github.com/leeguooooo/agent-cli-to-api agent-cli-to-api codex
-```
-
-### Cloudflare Tunnel
-
-```bash
-CODEX_GATEWAY_TOKEN=devtoken uv run agent-cli-to-api codex
-cloudflared tunnel --url http://127.0.0.1:8000
-```
-
-For advanced env vars, see `.env.example` and `codex_gateway/config.py`.
-
-</details>
-
 ## Keywords (SEO)
 
 OpenAI-compatible API, chat completions, SSE streaming, agent gateway, CLI to API proxy, Codex CLI, Cursor Agent, Claude Code, Gemini CLI.
-
-## Security notes
-
-You are exposing an agent that can read files and run commands depending on `CODEX_SANDBOX`.
-Keep it private by default, use a token, and run in an isolated environment when deploying.
-
-## Logging & Performance Diagnosis
-
-The gateway provides detailed timing logs to help diagnose latency:
-
-```
-INFO  claude-oauth request: url=https://api.example.com/v1/messages model=xxx auth_ms=0 prepare_ms=0
-INFO  claude-oauth response: status=200 api_latency_ms=2886 parse_ms=0 total_ms=2887
-```
-
-| Metric | Description |
-|--------|-------------|
-| `auth_ms` | Time to load/refresh credentials |
-| `prepare_ms` | Time to build request payload |
-| `api_latency_ms` | **Upstream API response time** (main bottleneck) |
-| `parse_ms` | Time to parse response |
-| `total_ms` | Total gateway processing time |
-
-If `api_latency_ms` ≈ `total_ms`, the latency is entirely from the upstream API (not the gateway).
-
-### Log modes
-
-```bash
-CODEX_LOG_MODE=summary  # one line per request (default)
-CODEX_LOG_MODE=qa       # show Q (question) and A (answer)
-CODEX_LOG_MODE=full     # full prompt + response
-```
-
-## Performance notes (important)
-
-If your normal `~/.codex/config.toml` has many `mcp_servers.*` entries, **Codex will start them for every `codex exec` call**
-and include their tool schemas in the prompt. This can add **seconds of startup time** and **10k+ prompt tokens** per request.
-
-For an HTTP gateway, it’s usually best to run Codex with a minimal config (no MCP servers).
-
-By default the gateway uses your system `~/.codex` (so auth stays in sync).
-If you want a minimal, isolated config (no MCP servers), set `CODEX_CLI_HOME` to a gateway-local directory.
-On first run it will try to copy `~/.codex/auth.json` into that directory (so you don’t have to).
-
-If you want to set it up manually or customize it:
-
-```bash
-export CODEX_CLI_HOME=$PWD/.codex-gateway-home
-mkdir -p "$CODEX_CLI_HOME/.codex"
-cp ~/.codex/auth.json "$CODEX_CLI_HOME/.codex/auth.json"   # or set CODEX_API_KEY instead
-cat > "$CODEX_CLI_HOME/.codex/config.toml" <<'EOF'
-model = "gpt-5.2"
-model_reasoning_effort = "low"
-
-[projects."/path/to/your/workspace"]
-trust_level = "trusted"
-EOF
-```
