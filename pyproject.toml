@@ -19,8 +19,15 @@ dependencies = [
   "uvicorn[standard]>=0.30.0",
 ]
 
+[project.optional-dependencies]
+desktop = ["PySide6>=6.6.0"]
+build = ["pyinstaller>=6.0"]
+
 [project.scripts]
 agent-cli-to-api = "codex_gateway.cli:main"
+
+[project.gui-scripts]
+agent-cli-to-api-desktop = "codex_gateway.desktop:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

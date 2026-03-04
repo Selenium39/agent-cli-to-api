@@ -25,3 +25,11 @@ The server binds to `127.0.0.1:8000` by default. Key endpoints: `GET /healthz`, 
 - **Backend CLIs are required** for actual request proxying. Without an authenticated CLI (codex, claude, gemini, or cursor-agent), the gateway starts but returns errors on `/v1/chat/completions`. The `/healthz`, `/v1/models`, and `/debug/config` endpoints work without any backend.
 - The gateway does **not** load `.env` by default. Use `--env-file .env` or `--auto-env` to load one.
 - `uv sync` is the canonical dependency install command (see `README.md`).
+
+### Desktop app
+
+The project includes a PySide6-based desktop GUI (`codex_gateway/desktop/`). Install with `uv sync --extra desktop`. On Linux, the following system packages are needed for Qt: `libegl1 libgl1 libxcb-icccm4 libxcb-image0 libxcb-cursor0 libxcb-keysyms1 libxcb-render-util0 libxcb-xkb1 libxkbcommon-x11-0`.
+
+Run the desktop app: `uv run agent-cli-to-api-desktop` (or `python -m codex_gateway.desktop`).
+
+Build standalone executables: `uv run --extra build python scripts/build_desktop.py` (uses PyInstaller).
