@@ -39,6 +39,14 @@ from .gemini_cloudcode import generate_cloudcode as gemini_cloudcode_generate
 from .gemini_cloudcode import iter_cloudcode_stream_events as iter_gemini_cloudcode_events
 from .gemini_cloudcode import warmup_gemini_caches
 from .http_client import aclose_all as _aclose_http_clients
+from .anthropic_compat import (
+    AnthropicRequest,
+    anthropic_request_to_chat_request,
+    anthropic_stream_delta,
+    anthropic_stream_end,
+    anthropic_stream_start,
+    openai_chat_completion_to_anthropic,
+)
 from .openai_compat import (
     ChatCompletionRequest,
     ChatMessage,
@@ -2333,3 +2341,152 @@ async def chat_completions(
         _request_stats.record_failure()
         _print_error_panel(resp_id, error_msg, status)
         return _openai_error(error_msg, status_code=status)
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API  (/v1/messages)
+# ---------------------------------------------------------------------------
+
+
+def _anthropic_error(message: str, *, status_code: int = 500, error_type: str = "api_error") -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "type": "error",
+            "error": {"type": error_type, "message": message},
+        },
+    )
+
+
+@app.post("/v1/messages")
+@app.post("/messages")
+async def anthropic_messages(
+    req: AnthropicRequest,
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """Anthropic-compatible ``/v1/messages`` endpoint.
+
+    Accepts the Anthropic Messages API format, routes through the same
+    backend pipeline as ``/v1/chat/completions``, and returns responses
+    in Anthropic format (including SSE streaming).
+    """
+    # Auth: accept both "Bearer <token>" (OpenAI style) and "x-api-key" header.
+    api_key = request.headers.get("x-api-key")
+    if api_key and settings.bearer_token:
+        if api_key != settings.bearer_token:
+            return _anthropic_error("Invalid API key", status_code=403, error_type="authentication_error")
+    else:
+        _check_auth(authorization)
+
+    # Convert Anthropic request → internal format.
+    chat_req = anthropic_request_to_chat_request(req)
+    if not chat_req.messages:
+        return _anthropic_error("messages: at least one message is required", status_code=400, error_type="invalid_request_error")
+
+    requested_model = req.model
+
+    if not req.stream:
+        # ── Non-streaming ──────────────────────────────────────────
+        # Force non-stream and delegate to the core handler.
+        chat_req_ns = chat_req.model_copy(update={"stream": False})
+        result = await chat_completions(
+            ChatCompletionRequestCompat(**chat_req_ns.model_dump()),
+            request,
+            authorization,
+        )
+
+        # Convert the OpenAI response to Anthropic format.
+        if isinstance(result, JSONResponse):
+            if result.status_code >= 400:
+                # Forward the error, re-wrapped in Anthropic format.
+                try:
+                    body = json.loads(result.body.decode("utf-8"))
+                    err_msg = body.get("error", {}).get("message", "Internal error")
+                except Exception:
+                    err_msg = "Internal error"
+                return _anthropic_error(err_msg, status_code=result.status_code)
+            try:
+                body = json.loads(result.body.decode("utf-8"))
+            except Exception:
+                return _anthropic_error("Failed to parse upstream response", status_code=500)
+            return JSONResponse(content=openai_chat_completion_to_anthropic(body, model_hint=requested_model))
+
+        if isinstance(result, dict):
+            return JSONResponse(content=openai_chat_completion_to_anthropic(result, model_hint=requested_model))
+
+        return _anthropic_error("Unexpected upstream response type", status_code=500)
+
+    # ── Streaming ──────────────────────────────────────────────
+    chat_req_s = chat_req.model_copy(update={"stream": True})
+    result = await chat_completions(
+        ChatCompletionRequestCompat(**chat_req_s.model_dump()),
+        request,
+        authorization,
+    )
+
+    if isinstance(result, JSONResponse):
+        # Error before streaming started.
+        if result.status_code >= 400:
+            try:
+                body = json.loads(result.body.decode("utf-8"))
+                err_msg = body.get("error", {}).get("message", "Internal error")
+            except Exception:
+                err_msg = "Internal error"
+            return _anthropic_error(err_msg, status_code=result.status_code)
+        return result
+
+    if not isinstance(result, StreamingResponse):
+        return _anthropic_error("Unexpected upstream response type", status_code=500)
+
+    async def _anthropic_sse_gen():
+        """Wrap the OpenAI SSE stream, translating chunks to Anthropic format."""
+        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        started = False
+
+        async for raw_chunk in result.body_iterator:
+            chunk_str = raw_chunk if isinstance(raw_chunk, str) else raw_chunk.decode("utf-8", errors="replace")
+
+            for line in chunk_str.split("\n"):
+                line = line.strip()
+                if not line or not line.startswith("data: "):
+                    continue
+                payload = line[6:]
+                if payload == "[DONE]":
+                    if not started:
+                        for s in anthropic_stream_start(model=requested_model, msg_id=msg_id):
+                            yield s
+                    for s in anthropic_stream_end():
+                        yield s
+                    return
+
+                try:
+                    obj = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                if not isinstance(obj, dict):
+                    continue
+
+                choices = obj.get("choices")
+                if not isinstance(choices, list) or not choices:
+                    continue
+                delta = choices[0].get("delta") or {}
+
+                if not started:
+                    for s in anthropic_stream_start(model=requested_model, msg_id=msg_id):
+                        yield s
+                    started = True
+
+                content = delta.get("content")
+                if isinstance(content, str) and content:
+                    yield anthropic_stream_delta(content)
+
+        # If the upstream closed without [DONE], send end events anyway.
+        if not started:
+            for s in anthropic_stream_start(model=requested_model, msg_id=msg_id):
+                yield s
+        for s in anthropic_stream_end():
+            yield s
+
+    return StreamingResponse(_anthropic_sse_gen(), media_type="text/event-stream")
